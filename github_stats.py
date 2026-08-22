@@ -49,10 +49,8 @@ class Queries(object):
                     json={"query": generated_query},
                 )
             result = await r_async.json()
-            if result is not None:
-                return result
-        except:
-            print("aiohttp failed for GraphQL query")
+        except Exception as e:
+            print(f"aiohttp failed for GraphQL query: {e}")
             # Fall back on non-async requests
             async with self.semaphore:
                 r_requests = requests.post(
@@ -61,9 +59,18 @@ class Queries(object):
                     json={"query": generated_query},
                 )
                 result = r_requests.json()
-                if result is not None:
-                    return result
-        return dict()
+
+        if not isinstance(result, dict):
+            raise RuntimeError(f"Unexpected GraphQL response: {result!r}")
+        # An auth failure comes back as {"message": "Bad credentials"} with no "data"
+        if result.get("data") is None:
+            raise RuntimeError(
+                "GraphQL query failed: "
+                f"{result.get('errors') or result.get('message') or result}"
+            )
+        if result.get("errors"):
+            print(f"GraphQL query returned partial data with errors: {result['errors']}")
+        return result
 
     async def query_rest(self, path: str, params: Optional[Dict] = None) -> Dict:
         """
@@ -81,6 +88,9 @@ class Queries(object):
                 params = dict()
             if path.startswith("/"):
                 path = path[1:]
+
+            status: Optional[int] = None
+            result: Any = None
             try:
                 async with self.semaphore:
                     r_async = await self.session.get(
@@ -88,17 +98,11 @@ class Queries(object):
                         headers=headers,
                         params=tuple(params.items()),
                     )
-                if r_async.status == 202:
-                    # print(f"{path} returned 202. Retrying...")
-                    print(f"A path returned 202. Retrying...")
-                    await asyncio.sleep(2)
-                    continue
-
-                result = await r_async.json()
-                if result is not None:
-                    return result
-            except:
-                print("aiohttp failed for rest query")
+                status = r_async.status
+                if status == 200:
+                    result = await r_async.json()
+            except Exception as e:
+                print(f"aiohttp failed for rest query: {e}")
                 # Fall back on non-async requests
                 async with self.semaphore:
                     r_requests = requests.get(
@@ -106,12 +110,25 @@ class Queries(object):
                         headers=headers,
                         params=tuple(params.items()),
                     )
-                    if r_requests.status_code == 202:
-                        print(f"A path returned 202. Retrying...")
-                        await asyncio.sleep(2)
-                        continue
-                    elif r_requests.status_code == 200:
-                        return r_requests.json()
+                    status = r_requests.status_code
+                    if status == 200:
+                        result = r_requests.json()
+
+            if status == 202:
+                # print(f"{path} returned 202. Retrying...")
+                print(f"A path returned 202. Retrying...")
+                await asyncio.sleep(2)
+                continue
+            if status == 401:
+                raise RuntimeError(
+                    "REST query returned 401 Unauthorized: the ACCESS_TOKEN "
+                    "secret is missing, expired, or invalid."
+                )
+            if status != 200:
+                print(f"A path returned {status}. Its data will be missing.")
+                return dict()
+            if result is not None:
+                return result
         # print(f"There were too many 202s. Data for {path} will be incomplete.")
         print("There were too many 202s. Data for this repository will be incomplete.")
         return dict()
@@ -492,7 +509,7 @@ Languages:
                 ):
                     continue
                 author = author_obj.get("author", {}).get("login", "")
-                if author != self.username:
+                if author.lower() != self.username.lower():
                     continue
 
                 for week in author_obj.get("weeks", []):
