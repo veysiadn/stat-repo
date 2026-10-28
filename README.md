@@ -1,4 +1,4 @@
-# [GitHub Stats Visualization]
+# GitHub Stats Visualization
 
 ## Background
 
