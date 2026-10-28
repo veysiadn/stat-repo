@@ -124,6 +124,35 @@ For more information on inaccuracies, see issue
 10. Star this repo if you like it!
 
 
+## Troubleshooting API responses
+
+The generation log identifies the REST endpoint, GitHub's error message, and
+available rate-limit, permission, and request-ID headers. These diagnostics never
+print the configured access token, but may expose private repository names and
+GitHub error details; consider log visibility before sharing them.
+
+- **202 Accepted**: GitHub is calculating repository statistics. Requests retry
+  every two seconds, up to 60 attempts, then skip the endpoint with a warning.
+- **204 No Content**: GitHub returned no statistics for this endpoint. It is
+  skipped; this is not an authentication failure.
+- **401 Unauthorized**: Generation stops because the token was rejected.
+- **403 Forbidden**: A working token can still lack access to a particular
+  repository or endpoint. Traffic views require repository push access and, for
+  fine-grained tokens, repository **Administration: read** permission. Merely
+  contributing to a repository does not grant traffic access. Also check
+  organization SSO authorization and token policies.
+- **403/429 rate limits**: Diagnostics distinguish rate limits using GitHub's
+  message and headers. `Retry-After` is seconds to wait; `X-RateLimit-Reset` is
+  a Unix timestamp. These responses are still skipped, not automatically
+  retried; rerun generation after the limit clears.
+
+The workflow's `contents: write` permission applies to its built-in
+`GITHUB_TOKEN`, not the separate `ACCESS_TOKEN` used to collect statistics.
+Skipped endpoints contribute no data, so generated totals can be incomplete.
+
+Run the diagnostic regression tests locally with
+`python3 -m unittest -v test_github_stats`.
+
 # Support the Project
 
 There are a few things you can do to support the project:

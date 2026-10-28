@@ -1,8 +1,9 @@
 #!/usr/bin/python3
 
 import asyncio
+import json
 import os
-from typing import Dict, List, Optional, Set, Tuple, Any, cast
+from typing import Dict, List, Mapping, Optional, Set, Tuple, Any, cast
 
 import aiohttp
 import requests
@@ -80,17 +81,14 @@ class Queries(object):
         :return: deserialized REST JSON output
         """
 
-        for _ in range(60):
-            headers = {
-                "Authorization": f"token {self.access_token}",
-            }
-            if params is None:
-                params = dict()
-            if path.startswith("/"):
-                path = path[1:]
+        path = path.lstrip("/")
+        headers = {"Authorization": f"token {self.access_token}"}
+        params = {} if params is None else params
 
+        for attempt in range(1, 61):
             status: Optional[int] = None
             result: Any = None
+            body = ""
             try:
                 async with self.semaphore:
                     r_async = await self.session.get(
@@ -98,11 +96,18 @@ class Queries(object):
                         headers=headers,
                         params=tuple(params.items()),
                     )
-                status = r_async.status
-                if status == 200:
-                    result = await r_async.json()
-            except Exception as e:
-                print(f"aiohttp failed for rest query: {e}")
+                    status = r_async.status
+                    response_headers = r_async.headers
+                    if status == 200:
+                        result = await r_async.json()
+                    else:
+                        body = await r_async.text()
+                    r_async.release()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                print(
+                    f"aiohttp failed for REST GET /{path}: "
+                    f"{str(e).replace(self.access_token, '[REDACTED]')}"
+                )
                 # Fall back on non-async requests
                 async with self.semaphore:
                     r_requests = requests.get(
@@ -111,27 +116,92 @@ class Queries(object):
                         params=tuple(params.items()),
                     )
                     status = r_requests.status_code
+                    response_headers = r_requests.headers
                     if status == 200:
                         result = r_requests.json()
+                    else:
+                        body = r_requests.text
 
             if status == 202:
-                # print(f"{path} returned 202. Retrying...")
-                print(f"A path returned 202. Retrying...")
+                print(
+                    f"REST GET /{path} returned 202 Accepted: GitHub is preparing "
+                    f"statistics. Retrying in 2 seconds (attempt {attempt}/60)."
+                )
                 await asyncio.sleep(2)
                 continue
+            if status == 204:
+                print(
+                    f"REST GET /{path} returned 204 No Content: GitHub returned "
+                    "no statistics. Skipping this endpoint; this is not an "
+                    "authentication failure."
+                )
+                return dict()
+            diagnostic = self._rest_diagnostic(path, status, response_headers, body)
             if status == 401:
                 raise RuntimeError(
-                    "REST query returned 401 Unauthorized: the ACCESS_TOKEN "
+                    f"{diagnostic} Unauthorized: the ACCESS_TOKEN "
                     "secret is missing, expired, or invalid."
                 )
             if status != 200:
-                print(f"A path returned {status}. Its data will be missing.")
+                print(f"{diagnostic} Skipping this endpoint; its data will be missing.")
                 return dict()
             if result is not None:
                 return result
-        # print(f"There were too many 202s. Data for {path} will be incomplete.")
-        print("There were too many 202s. Data for this repository will be incomplete.")
+        print(
+            f"REST GET /{path}: GitHub statistics were still pending after "
+            "60 attempts (202 Accepted). Skipping this endpoint; its data "
+            "will be missing."
+        )
         return dict()
+
+    def _rest_diagnostic(
+        self, path: str, status: Optional[int], headers: Mapping[str, str], body: str
+    ) -> str:
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            payload = {}
+        message = payload.get("message", "") if isinstance(payload, dict) else ""
+        if not isinstance(message, str):
+            message = ""
+        details = [f"REST GET /{path} returned {status}."]
+        if message:
+            details.append(f"GitHub: {message}")
+        elif body:
+            details.append(f"Response: {' '.join(body.split())[:300]}")
+        if status in (403, 429):
+            if (
+                status == 429
+                or headers.get("X-RateLimit-Remaining") == "0"
+                or headers.get("Retry-After") is not None
+                or "rate limit" in message.lower()
+            ):
+                details.append("GitHub rate limit reached; this does not imply an invalid token.")
+            else:
+                details.append(
+                    "Access forbidden; a valid token may lack access to this endpoint "
+                    "or repository. Check repository permissions and organization SSO/policies."
+                )
+                if path.endswith("/traffic/views"):
+                    details.append(
+                        "Traffic requires repository push access; fine-grained tokens "
+                        "also require repository Administration: read permission. "
+                        "Contributing to a repository alone does not grant traffic access."
+                    )
+        for name in (
+            "X-RateLimit-Remaining",
+            "X-RateLimit-Reset",
+            "Retry-After",
+            "X-GitHub-Request-Id",
+            "X-OAuth-Scopes",
+            "X-Accepted-OAuth-Scopes",
+            "X-Accepted-GitHub-Permissions",
+        ):
+            if headers.get(name) is not None:
+                details.append(f"{name}={headers[name]}")
+        return " ".join(" ".join(details).split()).replace(
+            self.access_token, "[REDACTED]"
+        )
 
     @staticmethod
     def repos_overview(
